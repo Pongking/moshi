@@ -6,6 +6,7 @@ from typing import Optional
 
 import mlx.core as mx
 
+from ..modules.conditioner import ConditionTensor
 from ..models import Lm
 from ..utils import sampling
 
@@ -17,6 +18,7 @@ class LmGen:
         max_steps: int,
         text_sampler: sampling.Sampler,
         audio_sampler: sampling.Sampler,
+        cfg_coef: float = 1.,
         check: bool = False,
     ):
         self.model: Lm = model
@@ -35,6 +37,7 @@ class LmGen:
         self.audio_delays = self.model.cfg.audio_delays
         self.max_delay = max(self.audio_delays)
         self.main_codebooks = self.model.cfg.depformer.num_slices
+        self.cfg_coef = cfg_coef
 
     @property
     def zero_token(self) -> int:
@@ -51,12 +54,12 @@ class LmGen:
         return -2
 
     # Runs one step of inference and return the generated text token.
-    def step(self, other_audio_tokens: mx.array) -> mx.array:
+    def step(self, other_audio_tokens: mx.array, ct: ConditionTensor | None = None) -> mx.array:
         if self.step_idx >= self.max_steps:
             raise ValueError(f"reached max-steps {self.max_steps}")
 
         if self.step_idx == 0:
-            text_tokens = mx.array([[32000]])
+            text_tokens = mx.array([[self.model.cfg.text_out_vocab_size]])
         else:
             text_tokens = self.gen_sequence[:, 0, self.step_idx - 1][None]
         self.gen_sequence[:, 1 + self.main_codebooks :, self.step_idx] = (
@@ -81,12 +84,13 @@ class LmGen:
         text_tokens, audio_tokens = self.model.sample(
             text_tokens,
             audio_tokens,
-            self.step_idx,
             self.text_sampler,
             self.audio_sampler,
+            ct=ct,
+            cfg_coef=self.cfg_coef,
         )
         assert text_tokens.shape == (1,), "invalid output text-token shape"
-        assert audio_tokens.shape == (8,), "invalid output audio-token shape"
+        assert audio_tokens.shape == (self.model.cfg.generated_codebooks,), "invalid output audio-token shape"
 
         self.gen_sequence[:, 0, self.step_idx] = text_tokens
         for cb_idx, delay in enumerate(self.audio_delays[: self.main_codebooks]):

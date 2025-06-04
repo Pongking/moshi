@@ -13,7 +13,7 @@ name = "rustymimi"
 crate-type = ["cdylib"]
 
 [dependencies]
-anyhow = "1"
-numpy = "0.21.0"
-pyo3 = "0.21.0"
-moshi = { path = "../moshi-core", version = "0.2.4" }
+anyhow = { workspace = true }
+numpy = { workspace = true }
+pyo3 = { workspace = true }
+moshi = { workspace = true }

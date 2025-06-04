@@ -55,6 +55,8 @@ There are three separate versions of the moshi inference stack in this repo.
 
 Finally, the code for the live demo is provided in the [`client/`](client/) directory.
 
+If you want to fine tune Moshi, head out to [kyutai-labs/moshi-finetune](https://github.com/kyutai-labs/moshi-finetune).
+
 
 ## Models
 
@@ -63,11 +65,13 @@ We release three models:
 - Moshi fine-tuned on a male synthetic voice (Moshiko),
 - Moshi fine-tuned on a female synthetic voice (Moshika).
 
+Note that this codebase also supports [Hibiki](https://github.com/kyutai-labs/hibiki), check out the dedicated repo for more information.
+
 Depending on the backend, the file format and quantization available will vary. Here is the list
 of the HuggingFace repo with each model. Mimi is bundled in each of those, and always use the same checkpoint format.
 
-- Moshika for PyTorch (bf16): [kyutai/moshika-pytorch-bf16](https://huggingface.co/kyutai/moshika-pytorch-bf16).
-- Moshiko for PyTorch (bf16): [kyutai/moshiko-pytorch-bf16](https://huggingface.co/kyutai/moshiko-pytorch-bf16).
+- Moshika for PyTorch (bf16, int8): [kyutai/moshika-pytorch-bf16](https://huggingface.co/kyutai/moshika-pytorch-bf16), [kyutai/moshika-pytorch-q8](https://huggingface.co/kyutai/moshika-pytorch-q8) (experimental).
+- Moshiko for PyTorch (bf16, int8): [kyutai/moshiko-pytorch-bf16](https://huggingface.co/kyutai/moshiko-pytorch-bf16), [kyutai/moshiko-pytorch-q8](https://huggingface.co/kyutai/moshiko-pytorch-q8) (experimental).
 - Moshika for MLX (int4, int8, bf16): [kyutai/moshika-mlx-q4](https://huggingface.co/kyutai/moshika-mlx-q4), [kyutai/moshika-mlx-q8](https://huggingface.co/kyutai/moshika-mlx-q8),  [kyutai/moshika-mlx-bf16](https://huggingface.co/kyutai/moshika-mlx-bf16).
 - Moshiko for MLX (int4, int8, bf16): [kyutai/moshiko-mlx-q4](https://huggingface.co/kyutai/moshiko-mlx-q4), [kyutai/moshiko-mlx-q8](https://huggingface.co/kyutai/moshiko-mlx-q8),  [kyutai/moshiko-mlx-bf16](https://huggingface.co/kyutai/moshiko-mlx-bf16).
 - Moshika for Rust/Candle (int8, bf16): [kyutai/moshika-candle-q8](https://huggingface.co/kyutai/moshika-candle-q8),  [kyutai/moshika-mlx-bf16](https://huggingface.co/kyutai/moshika-candle-bf16).
@@ -81,11 +85,11 @@ You will need at least Python 3.10, with 3.12 recommended. For specific requirem
 directories. You can install the PyTorch and MLX clients with the following:
 
 ```bash
-pip install moshi      # moshi PyTorch, from PyPI
-pip install moshi_mlx  # moshi MLX, from PyPI, best with Python 3.12.
+pip install -U moshi      # moshi PyTorch, from PyPI
+pip install -U moshi_mlx  # moshi MLX, from PyPI, best with Python 3.12.
 # Or the bleeding edge versions for Moshi and Moshi-MLX.
-pip install -e "git+https://git@github.com/kyutai-labs/moshi.git#egg=moshi&subdirectory=moshi"
-pip install -e "git+https://git@github.com/kyutai-labs/moshi.git#egg=moshi_mlx&subdirectory=moshi_mlx"
+pip install -U -e "git+https://git@github.com/kyutai-labs/moshi.git#egg=moshi&subdirectory=moshi"
+pip install -U -e "git+https://git@github.com/kyutai-labs/moshi.git#egg=moshi_mlx&subdirectory=moshi_mlx"
 
 pip install rustymimi  # mimi, rust implementation with Python bindings from PyPI
 ```
@@ -158,6 +162,7 @@ nor does it try to compensate for a growing lag by skipping frames.
 Alternatively you can run `python -m moshi_mlx.local_web` to use
 the web UI, the connection is via http and will be at [localhost:8998](http://localhost:8998).
 
+
 ## Rust
 
 In order to run the Rust inference server, use the following command from within
@@ -205,6 +210,16 @@ cargo run --bin moshi-cli -r -- tui --host localhost
 ```bash
 python -m moshi.client
 ```
+
+### Gradio Demo
+
+You can launch a Gradio demo locally with the following command:
+
+```bash
+python -m moshi.client_gradio --url <moshi-server-url>
+```
+
+Prior to running the Gradio demo, please install `gradio-webrtc>=0.0.18`.
 
 ### Docker Compose (CUDA only)
 

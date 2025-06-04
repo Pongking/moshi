@@ -60,6 +60,20 @@ def _is_distributed() -> bool:
     return distributed.is_initialized() and distributed.get_world_size() > 1
 
 
+def _average_tensors(tensors: tp.Sequence[torch.Tensor]) -> None:
+    if not _is_distributed():
+        return
+    world_size = distributed.get_world_size()
+    handles = []
+    for tensor in tensors:
+        handle = distributed.all_reduce(
+            tensor.data, op=distributed.ReduceOp.SUM, async_op=True)
+        handles.append(handle)
+    for tensor, handle in zip(tensors, handles):
+        handle.wait()
+        tensor.data /= world_size
+
+
 def _run_kmeans(samples: torch.Tensor, num_clusters: int, num_iters: int = 50) -> tp.Tuple[torch.Tensor, torch.Tensor]:
     # Kmeans algorithm used to initialize the codebooks.
     dim = samples.shape[-1]
@@ -135,6 +149,10 @@ class EuclideanCodebook(nn.Module):
         self._next_unused_check = check_unused_every
         self._cached_initialized = False
 
+        self._initialized: torch.Tensor
+        self.cluster_usage: torch.Tensor
+        self.embedding_sum: torch.Tensor
+        self._embedding: torch.Tensor
         self.register_buffer("_initialized", torch.tensor([False], dtype=torch.float))
         self.register_buffer("cluster_usage", torch.ones(codebook_size))
         embedding = torch.zeros(codebook_size, dim)
@@ -172,7 +190,7 @@ class EuclideanCodebook(nn.Module):
         """Cached version of self._initialized,
         This assumes that once the module is initialized, it will never go back to the uninitialized state."""
         if not self._cached_initialized:
-            self._cached_initialized = self._initialized.item()
+            self._cached_initialized = bool(self._initialized.item())
         return self._cached_initialized
 
     def _init_embedding(self, data: torch.Tensor) -> None:
@@ -477,6 +495,11 @@ class ResidualVectorQuantization(nn.Module):
         if self.training:
             # Solving subtle bug with STE and RVQ: https://github.com/facebookresearch/encodec/issues/25
             quantized_out = x + (quantized_out - x).detach()
+            to_average = []
+            for layer in self.layers:
+                assert isinstance(layer, VectorQuantization)
+                to_average += [layer._codebook.cluster_usage, layer._codebook.embedding_sum]
+                _average_tensors(to_average)
 
         out_losses, out_codes = map(torch.stack, (all_losses, all_codes))
         return _VQForwardResult(quantized_out, out_codes, out_losses, all_metrics)
@@ -487,6 +510,7 @@ class ResidualVectorQuantization(nn.Module):
         all_indices = []
         n_q = n_q or len(self.layers)
         for layer in self.layers[:n_q]:  # type: ignore
+            assert isinstance(layer, VectorQuantization)
             indices = layer.encode(residual)
             quantized = layer.decode(indices)
             residual = residual - quantized
@@ -499,5 +523,6 @@ class ResidualVectorQuantization(nn.Module):
         quantized = zero_scalar(codes.device)
         for idx, layer_codes in enumerate(codes):
             layer = self.layers[idx]
+            assert isinstance(layer, VectorQuantization)
             quantized = quantized + layer.decode(layer_codes)
         return quantized

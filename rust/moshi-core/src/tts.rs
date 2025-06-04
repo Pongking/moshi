@@ -2,14 +2,15 @@
 // This source code is licensed under the license found in the
 // LICENSE file in the root directory of this source tree.
 
-use candle::{DType, Result, Tensor, D};
+use crate::transformer::CaSrc;
+use candle::{Context, DType, Result, Tensor, D};
 use candle_nn::{linear_no_bias, Linear, VarBuilder};
 use candle_transformers::models::t5;
 
 pub struct Config {
     pub t5: t5::Config,
     pub lm: crate::lm::Config,
-    pub encodec: crate::encodec::Config,
+    pub mimi: crate::mimi::Config,
     pub max_duration_s: f64,
     pub speaker_cond_duration_s: f64,
     pub max_speakers: usize,
@@ -18,22 +19,22 @@ pub struct Config {
 impl Config {
     pub fn v0_1(t5: t5::Config) -> Self {
         let lm = crate::lm::Config::tts_v0_1();
-        let encodec = crate::encodec::Config::v0_1(None);
-        Self { t5, lm, encodec, max_duration_s: 60., speaker_cond_duration_s: 4., max_speakers: 5 }
+        let mimi = crate::mimi::Config::v0_1(None);
+        Self { t5, lm, mimi, max_duration_s: 60., speaker_cond_duration_s: 4., max_speakers: 5 }
     }
 
     pub fn v0_2(t5: t5::Config) -> Self {
         let lm = crate::lm::Config::tts_v0_1();
-        let encodec = crate::encodec::Config::v0_1(None);
-        Self { t5, lm, encodec, max_duration_s: 60., speaker_cond_duration_s: 10., max_speakers: 2 }
+        let mimi = crate::mimi::Config::v0_1(None);
+        Self { t5, lm, mimi, max_duration_s: 60., speaker_cond_duration_s: 10., max_speakers: 2 }
     }
 }
 
 #[derive(Clone)]
 pub struct Model {
     t5: t5::T5EncoderModel,
-    pub lm: crate::lm::Lm,
-    speaker_cond: Option<(crate::encodec::Encodec, Linear)>,
+    pub lm: crate::lm::LmModel,
+    speaker_cond: Option<(crate::mimi::Mimi, Linear)>,
     t5_proj: Linear,
     pub sample_rate: f64,
     frame_rate: f64,
@@ -55,13 +56,13 @@ impl Model {
         let speaker_cond = match vb_speaker_cond {
             None => None,
             Some(vb) => {
-                let encodec = crate::encodec::Encodec::new(cfg.encodec.clone(), vb)?;
+                let mimi = crate::mimi::Mimi::new(cfg.mimi.clone(), vb)?;
                 let proj = linear_no_bias(
-                    cfg.encodec.seanet.dimension,
+                    cfg.mimi.seanet.dimension,
                     cfg.lm.transformer.d_model,
                     vb_lm.pp("condition_provider.conditioners.speaker_wavs.output_proj"),
                 )?;
-                Some((encodec, proj))
+                Some((mimi, proj))
             }
         };
         let t5_proj = {
@@ -72,14 +73,15 @@ impl Model {
             };
             linear_no_bias(cfg.t5.d_model, cfg.lm.transformer.d_model, vb_lm.pp(name))?
         };
-        let lm = crate::lm::Lm::new(&cfg.lm, vb_lm)?;
+        let lm =
+            crate::lm::LmModel::new(&cfg.lm, crate::nn::MaybeQuantizedVarBuilder::Real(vb_lm))?;
         Ok(Self {
             t5,
             lm,
             speaker_cond,
             t5_proj,
-            sample_rate: cfg.encodec.sample_rate,
-            frame_rate: cfg.encodec.frame_rate,
+            sample_rate: cfg.mimi.sample_rate,
+            frame_rate: cfg.mimi.frame_rate,
             audio_vocab_size: cfg.lm.audio_vocab_size as u32,
             audio_codebooks: cfg.lm.audio_codebooks,
             max_duration_s: cfg.max_duration_s,
@@ -90,6 +92,7 @@ impl Model {
 }
 
 pub fn add_sin_embeddings(xs: &Tensor) -> Result<Tensor> {
+    let target_dtype = xs.dtype();
     let (_b_size, seq_len, dim) = xs.dims3()?;
     let dev = xs.device();
     let half_dim = dim / 2;
@@ -100,9 +103,9 @@ pub fn add_sin_embeddings(xs: &Tensor) -> Result<Tensor> {
     let inv_freq_len = inv_freq.len();
     let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), dev)?;
     let freqs = positions.broadcast_mul(&inv_freq)?;
-    let pos_emb = Tensor::cat(&[freqs.cos()?, freqs.sin()?], D::Minus1)?.to_dtype(xs.dtype())?;
-    let xs = xs.broadcast_add(&pos_emb)?;
-    Ok(xs)
+    let pos_emb = Tensor::cat(&[freqs.cos()?, freqs.sin()?], D::Minus1)?;
+    let xs = xs.to_dtype(DType::F32)?.broadcast_add(&pos_emb)?;
+    xs.to_dtype(target_dtype)
 }
 
 impl Model {
@@ -118,7 +121,7 @@ impl Model {
             Some(speaker_pcm) => {
                 let sc = match self.speaker_cond.as_mut() {
                     None => candle::bail!("speaker_pcm specified without a speaker-cond model"),
-                    Some((encodec, proj)) => encodec
+                    Some((mimi, proj)) => mimi
                         .encode_pre_quantize(speaker_pcm)?
                         .t()?
                         .to_dtype(candle::DType::BF16)?
@@ -158,6 +161,11 @@ impl Model {
         let audio_codebooks = self.audio_codebooks;
         let audio_vocab_size = self.audio_vocab_size;
         let mut audio_tokens: Vec<Vec<u32>> = vec![vec![u32::MAX; audio_codebooks]; max_steps + 2];
+        let forced_audio_tokens = crate::lm::ForcedAudioTokens::new(
+            /* acoustic_delay= */ 2,
+            self.lm.audio_pad_token(),
+            &[audio_codebooks],
+        );
         let quantizer_bins = audio_vocab_size - 2; // 2048
         for step_idx in 0..(max_steps + 2) {
             let mut codes = Vec::with_capacity(audio_codebooks);
@@ -176,16 +184,30 @@ impl Model {
                 let t = Tensor::new(&[t], conditions.device())?.unsqueeze(0)?;
                 codes.push(Some(t))
             }
-            let (_text_logits, ys) = self.lm.forward_ca(None, codes, conditions)?;
-            let df = match self.lm.depformer.as_mut() {
-                None => candle::bail!("no depformer"),
-                Some(df) => df,
-            };
+            let (_text_logits, ys) = self.lm.forward_ca(
+                None,
+                codes,
+                &CaSrc::Tokens(conditions.clone()),
+                None,
+                &().into(),
+            )?;
             let last_audio_tokens = if self.speaker_cond.is_some() {
-                df.sample_cfg(step_idx, &ys, cfg_alpha, None, &mut lp)?
+                self.lm.depformer_sample_cfg(
+                    &ys,
+                    cfg_alpha,
+                    None,
+                    forced_audio_tokens.forced_tokens(step_idx),
+                    &mut lp,
+                )?
             } else {
-                df.sample(step_idx, &ys, None, &mut lp)?
+                self.lm.depformer_sample(
+                    &ys,
+                    None,
+                    forced_audio_tokens.forced_tokens(step_idx),
+                    &mut lp,
+                )?
             };
+            let last_audio_tokens = last_audio_tokens.context("no depformer")?;
             for (c_idx, token) in last_audio_tokens.into_iter().enumerate() {
                 if step_idx > 0 && token >= quantizer_bins && self.end_of_gen.is_none() {
                     // Continue generating for two steps to get the final acoustic tokens.

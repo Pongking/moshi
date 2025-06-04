@@ -5,7 +5,8 @@
 use pyo3::prelude::*;
 
 use ::moshi as mm;
-use mm::{candle, candle_nn, conv, encodec, seanet, transformer};
+use mm::{candle, candle_nn, conv, mimi, seanet, transformer};
+use std::sync::{mpsc, Mutex};
 
 trait PyRes<R> {
     #[allow(unused)]
@@ -39,7 +40,7 @@ macro_rules! py_bail {
     };
 }
 
-fn encodec_cfg(max_seq_len: Option<usize>) -> encodec::Config {
+fn mimi_cfg(num_codebooks: usize, max_seq_len: Option<usize>) -> mimi::Config {
     let seanet_cfg = seanet::Config {
         dimension: 512,
         channels: 1,
@@ -82,17 +83,18 @@ fn encodec_cfg(max_seq_len: Option<usize>) -> encodec::Config {
         kv_repeat: 1,
         conv_layout: true, // see builders.py
         cross_attention: None,
+        shared_cross_attn: true,
         max_seq_len: max_seq_len.unwrap_or(8192), // the transformer works at 25hz so this is ~5 mins.
     };
-    encodec::Config {
+    mimi::Config {
         channels: 1,
         sample_rate: 24_000.,
         frame_rate: 12.5,
         renormalize: true,
-        resample_method: encodec::ResampleMethod::Conv,
+        resample_method: mimi::ResampleMethod::Conv,
         seanet: seanet_cfg,
         transformer: transformer_cfg,
-        quantizer_n_q: 8,
+        quantizer_n_q: num_codebooks,
         quantizer_bins: 2048,
         quantizer_dim: 256,
     }
@@ -100,16 +102,21 @@ fn encodec_cfg(max_seq_len: Option<usize>) -> encodec::Config {
 
 #[pyclass]
 struct Tokenizer {
-    encodec: encodec::Encodec,
+    mimi: mimi::Mimi,
     device: candle::Device,
     dtype: candle::DType,
 }
 
 #[pymethods]
 impl Tokenizer {
-    #[pyo3(signature = (path, *, dtype="f32", max_seq_len=None))]
+    #[pyo3(signature = (path, *, num_codebooks=8, dtype="f32", max_seq_len=None))]
     #[new]
-    fn new(path: std::path::PathBuf, dtype: &str, max_seq_len: Option<usize>) -> PyResult<Self> {
+    fn new(
+        path: std::path::PathBuf,
+        num_codebooks: usize,
+        dtype: &str,
+        max_seq_len: Option<usize>,
+    ) -> PyResult<Self> {
         let device = candle::Device::Cpu;
         let dtype = match dtype {
             "f32" => candle::DType::F32,
@@ -119,9 +126,9 @@ impl Tokenizer {
         };
         let vb =
             unsafe { candle_nn::VarBuilder::from_mmaped_safetensors(&[path], dtype, &device).w()? };
-        let cfg = encodec_cfg(max_seq_len);
-        let encodec = encodec::Encodec::new(cfg, vb).w()?;
-        Ok(Self { encodec, device, dtype })
+        let cfg = mimi_cfg(num_codebooks, max_seq_len);
+        let mimi = mimi::Mimi::new(cfg, vb).w()?;
+        Ok(Self { mimi, device, dtype })
     }
 
     fn encode(&mut self, pcm_data: numpy::PyReadonlyArray3<f32>) -> PyResult<PyObject> {
@@ -136,12 +143,12 @@ impl Tokenizer {
             .allow_threads(|| {
                 let pcm_data = candle::Tensor::from_slice(pcm_data, pcm_shape, &self.device)?
                     .to_dtype(self.dtype)?;
-                let codes = self.encodec.encode(&pcm_data)?;
+                let codes = self.mimi.encode(&pcm_data)?;
                 codes.to_vec3::<u32>()
             })
             .w()?;
-        let codes = numpy::PyArray3::from_vec3_bound(py, &codes)?;
-        Ok(codes.into_py(py))
+        let codes = numpy::PyArray3::from_vec3(py, &codes)?;
+        Ok(codes.into_any().unbind())
     }
 
     fn encode_step(&mut self, pcm_data: numpy::PyReadonlyArray3<f32>) -> PyResult<PyObject> {
@@ -156,7 +163,7 @@ impl Tokenizer {
             .allow_threads(|| {
                 let pcm_data = candle::Tensor::from_slice(pcm_data, pcm_shape, &self.device)?
                     .to_dtype(self.dtype)?;
-                let codes = self.encodec.encode_step(&pcm_data.into())?;
+                let codes = self.mimi.encode_step(&pcm_data.into(), &().into())?;
                 match codes.as_option() {
                     Some(codes) => Ok::<_, candle::Error>(Some(codes.to_vec3::<u32>()?)),
                     None => Ok(None),
@@ -165,8 +172,8 @@ impl Tokenizer {
             .w()?;
         match codes {
             Some(codes) => {
-                let codes = numpy::PyArray3::from_vec3_bound(py, &codes)?;
-                Ok(codes.into_py(py))
+                let codes = numpy::PyArray3::from_vec3(py, &codes)?;
+                Ok(codes.into_any().unbind())
             }
             None => Ok(py.None()),
         }
@@ -182,12 +189,12 @@ impl Tokenizer {
         let pcm = py
             .allow_threads(|| {
                 let codes = candle::Tensor::from_slice(codes, codes_shape, &self.device)?;
-                let pcm = self.encodec.decode(&codes)?.to_dtype(candle::DType::F32)?;
+                let pcm = self.mimi.decode(&codes)?.to_dtype(candle::DType::F32)?;
                 pcm.to_vec3::<f32>()
             })
             .w()?;
-        let pcm = numpy::PyArray3::from_vec3_bound(py, &pcm)?;
-        Ok(pcm.into_py(py))
+        let pcm = numpy::PyArray3::from_vec3(py, &pcm)?;
+        Ok(pcm.into_any().unbind())
     }
 
     fn decode_step(
@@ -204,7 +211,7 @@ impl Tokenizer {
         let pcm = py
             .allow_threads(|| {
                 let codes = candle::Tensor::from_slice(codes, codes_shape, &self.device)?;
-                let pcm = self.encodec.decode_step(&codes.into())?;
+                let pcm = self.mimi.decode_step(&codes.into(), &().into())?;
                 match pcm.as_option() {
                     Some(pcm) => {
                         let pcm = pcm.to_dtype(candle::DType::F32)?;
@@ -216,15 +223,15 @@ impl Tokenizer {
             .w()?;
         match pcm {
             Some(pcm) => {
-                let pcm = numpy::PyArray3::from_vec3_bound(py, &pcm)?;
-                Ok(pcm.into_py(py))
+                let pcm = numpy::PyArray3::from_vec3(py, &pcm)?;
+                Ok(pcm.into_any().unbind())
             }
             None => Ok(py.None()),
         }
     }
 
     fn reset(&mut self) {
-        self.encodec.reset_state()
+        self.mimi.reset_state()
     }
 }
 
@@ -232,17 +239,22 @@ impl Tokenizer {
 struct StreamTokenizer {
     #[allow(unused)]
     dtype: candle::DType,
-    encoder_rx: std::sync::mpsc::Receiver<Vec<Vec<u32>>>,
-    encoder_tx: std::sync::mpsc::Sender<Vec<f32>>,
-    decoder_rx: std::sync::mpsc::Receiver<Vec<f32>>,
-    decoder_tx: std::sync::mpsc::Sender<Vec<Vec<u32>>>,
+    encoder_rx: Mutex<mpsc::Receiver<Vec<Vec<u32>>>>,
+    encoder_tx: mpsc::Sender<Vec<f32>>,
+    decoder_rx: Mutex<mpsc::Receiver<Vec<f32>>>,
+    decoder_tx: mpsc::Sender<Vec<Vec<u32>>>,
 }
 
 #[pymethods]
 impl StreamTokenizer {
-    #[pyo3(signature = (path, *, dtype="f32", max_seq_len=None))]
+    #[pyo3(signature = (path, *, num_codebooks=8, dtype="f32", max_seq_len=None))]
     #[new]
-    fn new(path: std::path::PathBuf, dtype: &str, max_seq_len: Option<usize>) -> PyResult<Self> {
+    fn new(
+        path: std::path::PathBuf,
+        num_codebooks: usize,
+        dtype: &str,
+        max_seq_len: Option<usize>,
+    ) -> PyResult<Self> {
         let device = candle::Device::Cpu;
         let dtype = match dtype {
             "f32" => candle::DType::F32,
@@ -252,13 +264,13 @@ impl StreamTokenizer {
         };
         let vb =
             unsafe { candle_nn::VarBuilder::from_mmaped_safetensors(&[path], dtype, &device).w()? };
-        let cfg = encodec_cfg(max_seq_len);
-        let mut e_encodec = encodec::Encodec::new(cfg, vb).w()?;
-        let mut d_encodec = e_encodec.clone();
-        let (encoder_tx, e_rx) = std::sync::mpsc::channel::<Vec<f32>>();
-        let (decoder_tx, d_rx) = std::sync::mpsc::channel::<Vec<Vec<u32>>>();
-        let (d_tx, decoder_rx) = std::sync::mpsc::channel::<Vec<f32>>();
-        let (e_tx, encoder_rx) = std::sync::mpsc::channel::<Vec<Vec<u32>>>();
+        let cfg = mimi_cfg(num_codebooks, max_seq_len);
+        let mut e_mimi = mimi::Mimi::new(cfg, vb).w()?;
+        let mut d_mimi = e_mimi.clone();
+        let (encoder_tx, e_rx) = mpsc::channel::<Vec<f32>>();
+        let (decoder_tx, d_rx) = mpsc::channel::<Vec<Vec<u32>>>();
+        let (d_tx, decoder_rx) = mpsc::channel::<Vec<f32>>();
+        let (e_tx, encoder_rx) = mpsc::channel::<Vec<Vec<u32>>>();
         std::thread::spawn(move || {
             while let Ok(pcm_data) = e_rx.recv() {
                 // Can't wait for try blocks to be a thing
@@ -267,7 +279,7 @@ impl StreamTokenizer {
                     let pcm_data =
                         candle::Tensor::from_vec(pcm_data, (1, 1, l), &candle::Device::Cpu)?
                             .to_dtype(dtype)?;
-                    let codes = e_encodec.encode_step(&pcm_data.into())?;
+                    let codes = e_mimi.encode_step(&pcm_data.into(), &().into())?;
                     if let Some(codes) = codes.as_option() {
                         let mut codes = codes.to_vec3::<u32>()?;
                         e_tx.send(codes.remove(0))?;
@@ -282,7 +294,7 @@ impl StreamTokenizer {
             while let Ok(codes) = d_rx.recv() {
                 if let Err(err) = (|| {
                     let codes = candle::Tensor::new(codes, &candle::Device::Cpu)?.unsqueeze(2)?;
-                    let pcm_data = d_encodec.decode_step(&codes.into())?;
+                    let pcm_data = d_mimi.decode_step(&codes.into(), &().into())?;
                     if let Some(pcm_data) = pcm_data.as_option() {
                         let mut pcm_data = pcm_data.to_vec3::<f32>()?;
                         d_tx.send(pcm_data.remove(0).remove(0))?;
@@ -293,7 +305,13 @@ impl StreamTokenizer {
                 }
             }
         });
-        Ok(Self { dtype, encoder_rx, encoder_tx, decoder_rx, decoder_tx })
+        Ok(Self {
+            dtype,
+            encoder_rx: Mutex::new(encoder_rx),
+            encoder_tx,
+            decoder_rx: Mutex::new(decoder_rx),
+            decoder_tx,
+        })
     }
 
     fn encode(&mut self, pcm_data: numpy::PyReadonlyArray1<f32>) -> PyResult<()> {
@@ -314,28 +332,28 @@ impl StreamTokenizer {
     }
 
     fn get_encoded(&mut self, py: Python) -> PyResult<PyObject> {
-        match self.encoder_rx.try_recv() {
+        match self.encoder_rx.lock().unwrap().try_recv() {
             Ok(codes) => {
-                let codes = numpy::PyArray2::from_vec2_bound(py, &codes)?;
-                Ok(codes.into_py(py))
+                let codes = numpy::PyArray2::from_vec2(py, &codes)?;
+                Ok(codes.into_any().unbind())
             }
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+            Err(mpsc::TryRecvError::Disconnected) => {
                 py_bail!("worker thread disconnected")
             }
-            Err(std::sync::mpsc::TryRecvError::Empty) => Ok(py.None()),
+            Err(mpsc::TryRecvError::Empty) => Ok(py.None()),
         }
     }
 
     fn get_decoded(&mut self, py: Python) -> PyResult<PyObject> {
-        match self.decoder_rx.try_recv() {
+        match self.decoder_rx.lock().unwrap().try_recv() {
             Ok(pcm) => {
-                let pcm = numpy::PyArray1::from_vec_bound(py, pcm);
-                Ok(pcm.into_py(py))
+                let pcm = numpy::PyArray1::from_vec(py, pcm);
+                Ok(pcm.into_any().unbind())
             }
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+            Err(mpsc::TryRecvError::Disconnected) => {
                 py_bail!("worker thread disconnected")
             }
-            Err(std::sync::mpsc::TryRecvError::Empty) => Ok(py.None()),
+            Err(mpsc::TryRecvError::Empty) => Ok(py.None()),
         }
     }
 }

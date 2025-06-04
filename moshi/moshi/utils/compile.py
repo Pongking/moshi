@@ -128,6 +128,7 @@ def simple_checkpoint(module: torch.nn.Module, *args, **kwargs):
         module_for_sig = module._fsdp_wrapped_module
     else:
         module_for_sig = module
+    assert isinstance(module_for_sig, torch.nn.Module)
     sig = inspect.signature(module_for_sig.forward)
     # We first flatten all arguments to use only *args, to make things easier and because
     # torch.autograd.Function has weird support for kwargs.
@@ -242,6 +243,9 @@ class CUDAGraphed:
                     if source.shape != target.shape:
                         raise ValueError(
                             f"Argument #{idx} had shape {target.shape}, but got shape {source.shape}"
+                            "When using CUDAGraph, every call must be done with exactly the same shapes. "
+                            "Feel free to deactivate with the env variable NO_CUDA_GRAPH=1, or the decorator "
+                            "`with no_cuda_graph():`"
                         )
                     target.copy_(source)
                 else:
@@ -271,7 +275,6 @@ class CUDAGraphed:
                     return self.func(*args)
             else:
                 assert self._args is not None
-                assert self._output is not None
                 _match_values_copy_tensors(args, self._args)
                 self._graph.replay()
                 return self._output
